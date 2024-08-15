@@ -16,6 +16,7 @@ Usage:
 
 import logging
 import re
+from time import sleep
 
 import evaluate
 import hydra
@@ -26,6 +27,7 @@ from coral.data_collators import DataCollatorCTCWithPadding
 from coral.data_models import Processor
 from datasets import Audio, Dataset, DatasetDict, load_dataset
 from omegaconf import DictConfig
+from requests import HTTPError
 from transformers import (
     AutoModelForCTC,
     AutoProcessor,
@@ -57,6 +59,7 @@ def main(config: DictConfig) -> None:
         path=config.dataset_id,
         name=config.dataset_subset,
         split=config.dataset_split,
+        revision=config.dataset_revision,
         token=True,
         cache_dir=config.cache_dir,
     )
@@ -70,7 +73,7 @@ def main(config: DictConfig) -> None:
     )
 
     logger.info("Resampling audio to 16kHz...")
-    dataset = dataset.cast_column(
+    processed_dataset = dataset.cast_column(
         column=config.audio_column, feature=Audio(sampling_rate=16_000)
     )
 
@@ -82,13 +85,13 @@ def main(config: DictConfig) -> None:
             if tok not in processor.tokenizer.all_special_tokens
         ]
     )
-    dataset = process_dataset(
-        dataset=dataset,
+    processed_dataset = process_dataset(
+        dataset=processed_dataset,
         characters_to_keep=characters_to_keep,
         text_column=config.text_column,
         processor=processor,
     )
-    assert isinstance(dataset, DatasetDict)
+    assert isinstance(processed_dataset, DatasetDict)
 
     logger.info(f"Loading the {config.model_id!r} ASR model...")
     if torch.cuda.is_available():
@@ -118,27 +121,38 @@ def main(config: DictConfig) -> None:
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
     new_data_dict: dict[str, Dataset] = dict()
-    for split_name, split in dataset.items():
+    for split_name, split in processed_dataset.items():
         wers = get_wers(dataset=split, trainer=trainer, processor=processor)
-        split = split.add_column(
-            name="asr_wer", column=wers, new_fingerprint=split._fingerprint
+        new_data_dict[split_name] = (
+            dataset[split_name]
+            .add_column(name="asr_wer", column=wers, new_fingerprint=split._fingerprint)
+            .add_column(
+                name="asr_validation_model",
+                column=[config.model_id] * len(split),
+                new_fingerprint=split._fingerprint,
+            )
         )
-        split = split.add_column(
-            name="asr_validation_model",
-            column=[config.model_id] * len(split),
-            new_fingerprint=split._fingerprint,
-        )
-        new_data_dict[split_name] = split
 
     logger.info(f"Uploading the validated dataset to {config.output_dataset_id!r}...")
     new_dataset = DatasetDict(new_data_dict)
-    new_dataset.push_to_hub(
-        repo_id=config.output_dataset_id,
-        config_name=config.output_dataset_subset,
-        commit_message="Add ASR validation",
-        private=True,
-    )
-    logger.info("All done!")
+    for _ in range(60):
+        try:
+            new_dataset.push_to_hub(
+                repo_id=config.output_dataset_id,
+                config_name=config.output_dataset_subset,
+                max_shard_size="500MB",
+                commit_message="Add ASR validation",
+                private=True,
+            )
+            logger.info("All done!")
+            break
+        except (RuntimeError, HTTPError) as e:
+            logger.info(f"Error while pushing to hub: {e}")
+            logger.info("Waiting a minute before trying again...")
+            sleep(60)
+            logger.info("Retrying...")
+    else:
+        logger.error("Failed to upload the dataset to the Hugging Face Hub.")
 
 
 def process_dataset(
