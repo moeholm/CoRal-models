@@ -2,66 +2,18 @@
 
 import logging
 import os
-from functools import partial
-from typing import Callable
 
 from omegaconf import DictConfig
 from transformers import EarlyStoppingCallback, TrainerCallback
-from wandb.sdk.wandb_init import init as wandb_init
-from wandb.sdk.wandb_run import finish as wandb_finish
 
-from .data import load_data
+from .data import load_data_for_finetuning
 from .data_models import ModelSetup
+from .experiment_tracking.extracking_factory import load_extracking_setup
 from .model_setup import load_model_setup
-from .ngram import train_ngram_model
-from .utils import disable_tqdm
+from .ngram import train_and_store_ngram_model
+from .utils import block_terminal_output, disable_tqdm, push_model_to_hub
 
 logger = logging.getLogger(__package__)
-
-
-def prepare_dataset_example(example: dict, processor: Callable) -> dict:
-    """Prepare a dataset example for the model.
-
-    Args:
-        example:
-            The example from the dataset.
-        processor:
-            The processor to use.
-
-    Returns:
-        The prepared example.
-    """
-    # Prepare audio
-    audio = example["audio"]
-    sampling_rate = audio["sampling_rate"]
-    processed = processor(audio["array"], sampling_rate=sampling_rate)
-    if "input_values" in processed:
-        example["input_values"] = processed.input_values[0]
-        example["num_seconds"] = len(example["input_values"]) / sampling_rate
-    if "input_features" in processed:
-        example["input_features"] = processed.input_features[0]
-        example["num_seconds"] = len(example["input_features"]) / sampling_rate
-
-    # Prepare transcriptions
-    example["labels"] = processor(text=example["text"], truncation=True).input_ids
-    example["input_length"] = len(example["labels"])
-
-    return example
-
-
-def example_audio_is_short(example: dict, max_seconds_per_example: int) -> bool:
-    """Check if the example audio is too short.
-
-    Args:
-        example:
-            The example from the dataset.
-        max_seconds_per_example:
-            The maximum number of seconds per example.
-
-    Returns:
-        Whether the example audio is too short.
-    """
-    return example["num_seconds"] <= max_seconds_per_example
 
 
 def finetune(config: DictConfig) -> None:
@@ -74,30 +26,15 @@ def finetune(config: DictConfig) -> None:
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
 
-    model_setup: ModelSetup = load_model_setup(config)
+    model_setup: ModelSetup = load_model_setup(config=config)
     processor = model_setup.load_processor()
-    processor.save_pretrained(config.model_dir)
+    processor.save_pretrained(save_directory=config.model_dir)
     model = model_setup.load_model()
-    dataset = load_data(config)
+    dataset = load_data_for_finetuning(config=config, processor=processor)
 
-    dataset = dataset.map(
-        function=partial(prepare_dataset_example, processor=processor),
-        remove_columns=dataset["train"].column_names,
-    )
-    dataset = dataset.filter(
-        function=partial(
-            example_audio_is_short,
-            max_seconds_per_example=config.max_seconds_per_example,
-        )
-    )
-
-    if config.wandb and is_main_process:
-        wandb_init(
-            project=config.wandb_project,
-            group=config.wandb_group,
-            name=config.wandb_name,
-            config=dict(config),
-        )
+    if bool(config.experiment_tracking) and is_main_process:
+        extracking_setup = load_extracking_setup(config=config)
+        extracking_setup.run_initialization()
 
     if "val" not in dataset and is_main_process:
         logger.info("No validation set found. Disabling early stopping.")
@@ -113,17 +50,25 @@ def finetune(config: DictConfig) -> None:
         callbacks=load_early_stopping_callback(config) if "val" in dataset else None,
     )
 
+    block_terminal_output()
     with disable_tqdm():
         trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
 
-    if is_main_process:
-        wandb_finish()
-        model.save_pretrained(config.model_dir)
-        if config.push_to_hub:
-            trainer.push_to_hub()
+    if bool(config.experiment_tracking) and is_main_process:
+        extracking_setup.run_finalization()
 
-    if hasattr(config.model, "decoder") and config.model.decoder is not None:
-        train_ngram_model(config=config)
+    model.save_pretrained(save_directory=config.model_dir)
+
+    if hasattr(config.model, "use_decoder") and config.model.use_decoder:
+        train_and_store_ngram_model(config=config)
+
+    if config.push_to_hub:
+        push_model_to_hub(
+            trainer=trainer,
+            model_name=config.model_id,
+            finetuned_from=config.model.pretrained_model_id,
+            create_pr=config.create_pr,
+        )
 
 
 def load_early_stopping_callback(config: DictConfig) -> list[TrainerCallback]:

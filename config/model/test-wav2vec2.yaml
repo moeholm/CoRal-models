@@ -1,10 +1,11 @@
 name: test-wav2vec2
 type: wav2vec2
-pretrained_model_id: chcaa/xls-r-300m-danish
+pretrained_model_id: facebook/wav2vec2-xls-r-300m
 freeze_feature_encoder: true
 
 # Data hyperparameters
-clean_dataset: true
+lower_case: true
+clean_text: true
 
 # Model hyperparameters
 sampling_rate: 16_000
@@ -21,5 +22,8 @@ mask_feature_length: 64
 layerdrop: 0.1  # NOTE: This will automatically be set to 0 in a multi-gpu setting
 ctc_loss_reduction: mean
 
-# Decoder hyperparameters
-decoder: null
+# Model-specific optimisation hyperparameters
+learning_rate: 1e-4
+
+# Decoder hyperparameters
+use_decoder: false

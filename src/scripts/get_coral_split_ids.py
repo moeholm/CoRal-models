@@ -1,36 +1,30 @@
 """Get the speaker IDs for the CoRal test and validation splits.
 
-The test set is subject to the following constraints:
-    - At least 7.5 hours
-    - At least 40% of the test set must be of each gender
-    - At least 20% of the test set must be of each age group (0-24, 25-49, 50+)
-    - At least 10% of the test set must be of each dialect group
-    - At least 5% of the test set must be of speakers with a foreign accent
-
-The validation split has no formal criteria, but must be significantly smaller than the
-test set and should have roughly the same distribution.
-
-These constraints, along with all the other hyperparameters related to the creation of
-the splits, are defined in the `dataset_creation` configuration file.
-
 Developers:
     - Oliver Kinch (oliver.kinch@alexandra.dk)
     - Dan Saattrup Nielsen (dan.nielsen@alexandra.dk)
 
 Usage:
-    python src/scripts/get_coral_split_ids.py <key>=<value> <key>=<value> ...
+    python src/scripts/get_coral_split_ids.py [key=value] [key=value] ...
 """
 
 import logging
+import warnings
 from pathlib import Path
 from typing import NamedTuple
 
 import hydra
 import numpy as np
 import pandas as pd
-import torch
-from datasets import IterableDataset, load_dataset
+from datasets import (
+    DatasetDict,
+    IterableDatasetDict,
+    concatenate_datasets,
+    load_dataset,
+)
+from joblib import Parallel, delayed
 from omegaconf import DictConfig
+from pandas.errors import SettingWithCopyWarning
 from tqdm.auto import tqdm
 
 logging.basicConfig(
@@ -39,6 +33,197 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("get_coral_split_ids")
+
+warnings.filterwarnings("ignore", category=SettingWithCopyWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+@hydra.main(config_path="../../config", config_name="split_creation", version_base=None)
+def main(config: DictConfig) -> None:
+    """Main function to get the speaker IDs for the CoRal test and validation splits.
+
+    Args:
+        config:
+            The Hydra configuration object
+    """
+    mean_seconds_per_sample = config.mean_seconds_per_sample
+    num_attempts = config.num_split_attempts
+    df = load_coral_metadata_df(
+        sub_dialect_to_dialect=config.sub_dialect_to_dialect,
+        age_groups=config.age_groups,
+        max_cer=config.requirements.max_cer,
+        streaming=config.streaming,
+        dataset_path=config.dataset_path,
+        revision=config.dataset_revision,
+        cache_dir=config.cache_dir,
+    )
+    logger.info(f"Loaded processed CoRal metadata with {len(df):,} samples.")
+
+    def compute_test_candidate(
+        seed: int,
+        requirements: dict[str, float],
+        banned_speakers: set[str],
+        min_hours: float,
+        max_hours: float,
+    ) -> EvalDataset | None:
+        candidate = EvalDataset(
+            df=df,
+            min_samples=int(min_hours * 60 * 60 / mean_seconds_per_sample),
+            max_samples=int(max_hours * 60 * 60 / mean_seconds_per_sample),
+            requirements=requirements,
+            banned_speakers=banned_speakers,
+            seed=seed,
+            genders=config.genders,
+            dialects=config.dialects,
+            age_groups=config.age_groups,
+            mean_seconds_per_sample=mean_seconds_per_sample,
+        )
+        if not candidate.satisfies_requirements:
+            return None
+        return candidate
+
+    # Build test split
+    test_candidates: set[EvalDataset] = set()
+    test_dataset: EvalDataset | None = None
+    seed_start = 0
+    while True:
+        new_test_candidates: set[EvalDataset] = set()
+        while len(new_test_candidates) == 0:
+            with Parallel(n_jobs=-2, batch_size=10) as parallel:
+                new_test_candidates = set(
+                    parallel(
+                        delayed(function=compute_test_candidate)(
+                            seed=seed,
+                            requirements=dict(
+                                gender=config.requirements.test.gender_pct,
+                                dialect=config.requirements.test.dialect_pct,
+                                age_group=config.requirements.test.age_group_pct,
+                            ),
+                            banned_speakers=set(config.banned_speakers),
+                            min_hours=config.requirements.test.min_hours,
+                            max_hours=config.requirements.test.max_hours,
+                        )
+                        for seed in tqdm(
+                            range(seed_start, seed_start + num_attempts),
+                            desc=(
+                                f"Computing test splits with seed starting at "
+                                f"{seed_start}"
+                            ),
+                        )
+                    )
+                )
+            new_test_candidates = {
+                candidate
+                for candidate in new_test_candidates
+                if candidate is not None and candidate not in test_candidates
+            }
+            seed_start += num_attempts
+
+        test_candidates |= new_test_candidates
+
+        logger.info(
+            f"Found {len(new_test_candidates):,} new test candidate(s), now at "
+            f"{len(test_candidates):,} in total. Finding validation splits to match..."
+        )
+
+        # Pick the test dataset that is both short, difficult and equally distributed
+        difficulty_sorted_candidates = sorted(
+            test_candidates, key=lambda x: x.difficulty, reverse=True
+        )
+        length_sorted_candidates = sorted(test_candidates, key=len)
+        equal_distribution_sorted_candidates = sorted(
+            test_candidates,
+            key=lambda candidate: sum(
+                np.var(list(pct_dict.values()))
+                for pct_dict in candidate.normalised_counts.values()
+            ),
+        )
+        candidate_ranks = {
+            candidate: difficulty_sorted_candidates.index(candidate)
+            + length_sorted_candidates.index(candidate)
+            + equal_distribution_sorted_candidates.index(candidate)
+            for candidate in test_candidates
+        }
+        best_test_candidates = sorted(
+            test_candidates, key=lambda x: candidate_ranks[x]
+        )[: config.val_attempts]
+
+        if test_dataset in best_test_candidates:
+            idx = best_test_candidates.index(test_dataset)
+            best_test_candidates = best_test_candidates[:idx]
+            if len(best_test_candidates) == 0:
+                logger.info(
+                    "The best test candidate is still the same we found last time. "
+                    "Finding more test candidates..."
+                )
+                continue
+
+        # Build validation split
+        val_candidates: list[EvalDataset] = list()
+        with Parallel(n_jobs=-2, batch_size=10) as parallel:
+            for idx, best_test_candidate in enumerate(best_test_candidates):
+                val_candidates = parallel(
+                    delayed(function=compute_test_candidate)(
+                        seed=seed,
+                        requirements=dict(
+                            gender=config.requirements.val.gender_pct,
+                            dialect=config.requirements.val.dialect_pct,
+                            age_group=config.requirements.val.age_group_pct,
+                        ),
+                        banned_speakers=(
+                            best_test_candidate.speakers | set(config.banned_speakers)
+                        ),
+                        min_hours=config.requirements.val.min_hours,
+                        max_hours=config.requirements.val.max_hours,
+                    )
+                    for seed in tqdm(
+                        range(num_attempts),
+                        desc=f"Computing val splits for test candidate {idx}",
+                    )
+                )
+                val_candidates = [
+                    candidate for candidate in val_candidates if candidate is not None
+                ]
+                if len(val_candidates) > 0:
+                    test_dataset = best_test_candidate
+                    break
+                test_candidates.remove(best_test_candidate)
+            else:
+                logger.info(
+                    f"Could not find a suitable validation split for any of the "
+                    f"{len(best_test_candidates):,} test splits. Resuming to find "
+                    "more test splits..."
+                )
+                continue
+
+        # Pick the validation dataset that is both short, difficult and equally
+        # distributed
+        length_sorted_candidates = sorted(val_candidates, key=len)
+        difficulty_sorted_candidates = sorted(
+            val_candidates, key=lambda x: x.difficulty, reverse=True
+        )
+        equal_distribution_sorted_candidates = sorted(
+            val_candidates,
+            key=lambda candidate: sum(
+                np.var(list(pct_dict.values()))
+                for pct_dict in candidate.normalised_counts.values()
+            ),
+        )
+        candidate_ranks = {
+            candidate: difficulty_sorted_candidates.index(candidate)
+            + length_sorted_candidates.index(candidate)
+            + equal_distribution_sorted_candidates.index(candidate)
+            for candidate in val_candidates
+        }
+        val_dataset = min(val_candidates, key=lambda x: candidate_ranks[x])
+
+        assert (
+            test_dataset is not None
+            and set(test_dataset.speakers).intersection(val_dataset.speakers) == set()
+        )
+
+        logger.info(f"Test dataset:\n{test_dataset}")
+        logger.info(f"Validation dataset:\n{val_dataset}")
 
 
 class AgeGroup(NamedTuple):
@@ -53,7 +238,7 @@ class AgeGroup(NamedTuple):
             return f"{self.min}-"
         return f"{self.min}-{self.max - 1}"
 
-    def __in__(self, age: int) -> bool:
+    def __contains__(self, age: object) -> bool:
         """Check if an age is in the age group.
 
         Args:
@@ -63,10 +248,12 @@ class AgeGroup(NamedTuple):
         Returns:
             Whether the age is in the age group.
         """
+        if not isinstance(age, int):
+            return False
         return self.min <= age and (self.max is None or age < self.max)
 
 
-class Dataset:
+class EvalDataset:
     """Dataset class to keep track of the samples in the dataset.
 
     Attributes:
@@ -92,8 +279,8 @@ class Dataset:
             Count of each feature in the dataset.
         weights (dict):
             Weights of each feature in the dataset.
-        betas (dict):
-            Shift the weights of the least represented feature.
+        satisfies_requirements (bool):
+            If the dataset satisfies all the requirements.
     """
 
     def __init__(
@@ -107,7 +294,6 @@ class Dataset:
         genders: list[str],
         dialects: list[str],
         age_groups: list[tuple[int, int]],
-        accents: list[str],
         mean_seconds_per_sample: float,
     ) -> None:
         """Initialise the Dataset class.
@@ -131,8 +317,6 @@ class Dataset:
                 A list of possible dialect values.
             age_groups:
                 A list of tuples with the minimum and maximum age of each age group.
-            accents:
-                A list of possible accent values.
             mean_seconds_per_sample:
                 The mean duration of a sample in seconds. Only used for logging.
         """
@@ -152,56 +336,61 @@ class Dataset:
             gender={gender: 0 for gender in genders},
             dialect={dialect: 0 for dialect in dialects},
             age_group={str(age_group): 0 for age_group in self.age_groups},
-            accent={accent: 0 for accent in accents},
         )
-        self.weights: dict[str, dict[str, float]] = {
-            key: self._make_weights(count, beta=0) for key, count in self.counts.items()
+        self.satisfies_requirements = True
+        self.populate()
+
+    @property
+    def difficulty(self) -> float:
+        """Return the difficulty of the dataset."""
+        return self.df.loc[self.indices].asr_cer.mean()
+
+    @property
+    def normalised_counts(self) -> dict[str, dict[str, float]]:
+        """Return the normalised counts of the dataset."""
+        return {
+            key: {
+                feature: count / len(self) if len(self) > 0 else 0
+                for feature, count in count_list.items()
+            }
+            for key, count_list in self.counts.items()
         }
-        self.betas = dict(dialect=100.0, age_group=5.0)
-        self.add_dialect_samples()
 
-    def add_speaker_samples(self, speaker: str) -> "Dataset":
-        """Add all samples of a speaker to the dataset.
+    @property
+    def weights(self) -> dict[str, dict[str, float]]:
+        """The weights of the different features (such as dialect and age group).
 
-        Args:
-            speaker:
-                The id of the speaker
-        """
-        self.speakers.add(speaker)
-
-        speaker_samples = self.df.query("id_speaker == @speaker")
-        n_samples = len(speaker_samples)
-        indices = speaker_samples.index.tolist()
-        self.indices.extend(indices)
-
-        # Assuming that all samples of a speaker have the same gender, dialect,
-        # age_group, and native_language
-        row = speaker_samples.iloc[0]
-        for key, count in self.counts.items():
-            if key == "age":
-                row["age"] = age_to_group(age=row["age"], age_groups=self.age_groups)
-            count[row[key]] += n_samples
-
-        self._update_weights()
-
-        return self
-
-    def _give_score(self, row: pd.Series) -> float:
-        """Return a score of a speaker in a row."""
-        return sum(
-            weight[row[key]]  # type: ignore[index]
-            for key, weight in self.weights.items()
-        )
-
-    def add_dialect_samples(self) -> "Dataset":
-        """Get samples of dialects each dialect.
-
-        Args:
-            dataset:
-                Dataset object.
+        The weights are computed as follows:
+            1. We first normalise the counts to probabilities. This is because we want
+               to sum up these weights for the different features, and using
+               probabilities instead of counts ensures that they're on the same scale,
+               making each feature equally important.
+            2. Next, we divide the normalised counts by the minimum value required for
+               the feature that we're currently computing the weights for. This will
+               yield values that are 1 when the feature is at the minimum value.
+            3. We next subtract these values from 1, which results in values that are 1
+               when the feature is near zero, and less than or equal to zero when the
+               feature is at the minimum required value.
+            4. Since we don't want negative weights, we clamp the values to be at least
+               a small positive value. We don't clamp to zero here, as we might dividing
+               by zero later on in that case.
 
         Returns:
-            Dataset object with samples of each dialect.
+            The weights
+        """
+        return {
+            feature: {
+                feature_value: max(1 - pct / self.requirements[feature], 1e-6)
+                for feature_value, pct in pct_dict.items()
+            }
+            for feature, pct_dict in self.normalised_counts.items()
+        }
+
+    def populate(self) -> "EvalDataset":
+        """Populate the dataset with samples.
+
+        Returns:
+            EvalDataset object with samples.
         """
         df_speaker = self.df.drop_duplicates(subset="id_speaker").query(
             "id_speaker not in @self.banned_speakers"
@@ -219,12 +408,10 @@ class Dataset:
             and len(self) < self.max_samples
         ):
             speakers = df_speaker["id_speaker"].tolist()
-            scores = df_speaker.apply(func=self._give_score, axis=1).tolist()
-            probs = (
-                torch.softmax(torch.tensor(scores), dim=0)
-                .clamp(min=torch.tensor(0), max=torch.tensor(1))
-                .tolist()
-            )
+            scores = df_speaker.apply(func=self._compute_score, axis=1).tolist()
+
+            # Normalise the scores to probabilities
+            probs = [score / sum(scores) for score in scores]
 
             # Ensure that the probabilities sum to 1, as this is required by the
             # `choice` function. We do this by changing the last probability to 1 - the
@@ -241,43 +428,53 @@ class Dataset:
             speaker = self.rng.choice(speakers, p=probs)
             self.add_speaker_samples(speaker=speaker)
 
+        if len(self) >= self.max_samples:
+            self.satisfies_requirements = False
+
         return self
 
-    def _update_weights(self) -> "Dataset":
-        """Update the weights."""
-        self.weights = {
-            key: self._make_weights(count, beta=self.betas.get(key, 0))
-            for key, count in self.counts.items()
-        }
-        return self
-
-    def _make_weights(self, count: dict[str, int], beta: float) -> dict:
-        """Make a weight mapping for a feature, based on counts.
+    def add_speaker_samples(self, speaker: str) -> "EvalDataset":
+        """Add all samples of a speaker to the dataset.
 
         Args:
-            count:
-                Counts for a feature.
-            beta:
-                Shift the weights of the least represented feature.
+            speaker:
+                The ID of the speaker
+        """
+        self.speakers.add(speaker)
+
+        speaker_samples = self.df.query("id_speaker == @speaker")
+        n_samples = len(speaker_samples)
+        indices = speaker_samples.index.tolist()
+        self.indices.extend(indices)
+
+        # Assuming that all samples of a speaker have the same gender, dialect,
+        # age_group, and native_language
+        row = speaker_samples.iloc[0]
+        for key, count in self.counts.items():
+            count[row[key]] += n_samples
+
+        return self
+
+    def _compute_score(self, row: pd.Series) -> float:
+        """Compute the score of a speaker in a row.
+
+        The score is computed as the sum of the weights of the features of the speaker.
+
+        Args:
+            row:
+                The row of the dataframe.
 
         Returns:
-            Weight mapping for the feature.
+            The score of the speaker.
         """
-        inv_count = {key: 1 / (1 + value) for key, value in count.items()}
-        normalizer = sum(inv_count.values())
-        weights = {key: value / normalizer for key, value in inv_count.items()}
-
-        # Increase chance of sampling the least represented feature
-        max_key = max(weights, key=weights.get)  # type: ignore[arg-type]
-        weights[max_key] += weights[max_key] * beta
-
-        return weights
+        return sum(weight[row[key]] for key, weight in self.weights.items())
 
     def __repr__(self) -> str:
-        """Return the string representation of the Dataset class."""
+        """Return the string representation of the EvalDataset class."""
         num_hours = len(self) * self.mean_seconds_per_sample / 60 / 60
         msg = (
             f"\nEstimated number of hours: {num_hours:.2f}"
+            f"\nDifficulty: {self.difficulty:.2f}"
             f"\nSpeaker IDs: {self.speakers}\n\n"
         )
 
@@ -316,10 +513,18 @@ def age_to_group(age: int, age_groups: list[AgeGroup]) -> str:
     for age_group in age_groups:
         if age in age_group:
             return str(age_group)
-    raise ValueError(f"Age {age} not in any age group.")
+    raise ValueError(f"Age {age} not in any age group, out of {age_groups}.")
 
 
-def load_coral_metadata_df(sub_dialect_to_dialect: dict[str, str]) -> pd.DataFrame:
+def load_coral_metadata_df(
+    sub_dialect_to_dialect: dict[str, str],
+    age_groups: list[tuple[int, int]],
+    max_cer: float,
+    streaming: bool,
+    dataset_path: str,
+    revision: str,
+    cache_dir: str | None,
+) -> pd.DataFrame:
     """Load the metadata of the CoRal dataset.
 
     If the metadata is not found, it will be downloaded.
@@ -327,6 +532,20 @@ def load_coral_metadata_df(sub_dialect_to_dialect: dict[str, str]) -> pd.DataFra
     Args:
         sub_dialect_to_dialect:
             A mapping from sub-dialect to dialect.
+        age_groups:
+            The age groups to use for splitting.
+        max_cer:
+            The maximum CER of a sample.
+        streaming:
+            Whether to load the dataset in streaming mode. Only relevant if `dataset` is
+            None.
+        dataset_path:
+            The path to the dataset to load.
+        revision:
+            The revision of the dataset to load. If None, the latest revision is used.
+        cache_dir:
+            The directory to cache the dataset in. If None then the standard cache
+            directory is used.
 
     Returns:
         The metadata of the CoRal dataset.
@@ -334,120 +553,90 @@ def load_coral_metadata_df(sub_dialect_to_dialect: dict[str, str]) -> pd.DataFra
     metadata_path = Path("coral-metadata.csv")
 
     if metadata_path.exists():
-        df = pd.read_csv(metadata_path, low_memory=False)
-    else:
-        coral = load_dataset(
-            path="alexandrainst/coral", split="train", streaming=True
-        ).remove_columns("audio")
-        assert isinstance(coral, IterableDataset)
+        return pd.read_csv(metadata_path, low_memory=False)
 
-        coral_splits: dict | None = coral.info.splits
-        assert coral_splits is not None, "No splits found in CoRal dataset."
+    dataset = load_dataset(
+        path=dataset_path,
+        name="read_aloud",
+        revision=revision,
+        streaming=streaming,
+        cache_dir=cache_dir,
+    ).remove_columns("audio")
+
+    if streaming:
+        assert isinstance(dataset, IterableDatasetDict)
 
         # This will download the dataset with a progress bar, and remove the audio
         # column along the way, to save memory.
+        num_samples = sum(
+            split.info.splits[split_name].num_examples
+            for split_name, split in dataset.items()
+        )
         metadata = [
             sample
+            for split in dataset.values()
             for sample in tqdm(
-                coral,
-                total=coral_splits["train"].num_examples,
-                desc="Downloading CoRal dataset",
+                split, total=num_samples, desc="Downloading CoRal dataset"
             )
         ]
         df = pd.DataFrame(metadata)
 
-        # Map the dialects to the dialect categories that we use for splitting
-        df.dialect = df.dialect.map(sub_dialect_to_dialect)
-
-        # Aggregate accents into binary "native" and "foreign" categories, as there are
-        # too few non-native speakers to have a separate category for each accent.
-        df["accent"] = df.language_native.apply(
-            lambda x: "native" if x == "da" else "foreign"
+    else:
+        assert isinstance(dataset, DatasetDict)
+        merged_dataset = concatenate_datasets(
+            dsets=[split for split in dataset.values() if split is not None]
         )
+        df = pd.DataFrame(merged_dataset.to_pandas())
 
-        # We remove the nonbinary speakers from being in the validation and test sets,
-        # since there are only 3 such speakers in the dataset - they will be part of the
-        # training split instead.
-        df = df.query("gender != 'nonbinary'")
+    logger.info(f"Downloaded CoRal metadata with {len(df):,} raw samples.")
 
-        # TODO: Filter the dataframe by auto-validation WER, to ensure that only the
-        # high-quality samples are included in the validation and test sets.
+    # Map the dialects to the dialect categories that we use for splitting
+    all_dialects = set(df.dialect.unique())
+    missing_dialects = all_dialects - set(sub_dialect_to_dialect.keys())
+    if missing_dialects:
+        raise ValueError(
+            f"Missing dialects in sub_dialect_to_dialect mapping: {missing_dialects}"
+        )
+    df.dialect = df.dialect.map(sub_dialect_to_dialect)
 
-        # Store the metadata for future use
-        df.to_csv("coral-metadata.csv", index=False)
+    # For non-native speakers, we use the accent as the dialect
+    df.country_birth = df.country_birth.map(lambda x: "DK" if x is None else x)
+    df.loc[df.country_birth != "DK", "dialect"] = "Non-native"
+
+    # We remove the nonbinary speakers from being in the validation and test sets,
+    # since there are only 3 such speakers in the dataset - they will be part of the
+    # training split instead.
+    samples_before = len(df)
+    df = df.query("gender != 'nonbinary'")
+    samples_removed = samples_before - len(df)
+    logger.info(f"Removed {samples_removed:,} nonbinary samples.")
+
+    # Convert age to age group
+    df["age_group"] = df.age.apply(
+        lambda age: age_to_group(
+            age=age,
+            age_groups=[
+                AgeGroup(min=min_age, max=max_age) for min_age, max_age in age_groups
+            ],
+        )
+    )
+
+    # Remove the manually rejected samples
+    samples_before = len(df)
+    df = df.query("validated != 'rejected' and validated != 'maybe'")
+    samples_removed = samples_before - len(df)
+    logger.info(f"Removed {samples_removed:,} manually rejected samples.")
+
+    # Remove the automatically rejected samples
+    samples_before = len(df)
+    df = df.query("asr_cer < @max_cer")
+    samples_removed = samples_before - len(df)
+    logger.info(f"Removed {samples_removed:,} samples with CER > {max_cer}.")
+
+    # Store the metadata for future use
+    df.to_csv("coral-metadata.csv", index=False)
 
     return df
-
-
-@hydra.main(
-    config_path="../../config", config_name="dataset_creation", version_base=None
-)
-def main(config: DictConfig) -> None:
-    """Main function to get the speaker IDs for the CoRal test and validation splits.
-
-    Args:
-        config:
-            The Hydra configuration object
-    """
-    mean_seconds_per_sample = config.mean_seconds_per_sample
-    num_attempts = config.num_split_attempts
-    df = load_coral_metadata_df(sub_dialect_to_dialect=config.sub_dialect_to_dialect)
-
-    # Build test split
-    test_candidates: list[Dataset] = list()
-    min_test_hours = config.requirements.test.min_hours
-    max_test_hours = config.requirements.test.max_hours
-    for seed in tqdm(range(4242, 4242 + num_attempts), desc="Computing test splits"):
-        test_candidate = Dataset(
-            df=df,
-            min_samples=int(min_test_hours * 60 * 60 / mean_seconds_per_sample),
-            max_samples=int(max_test_hours * 60 * 60 / mean_seconds_per_sample),
-            requirements=dict(
-                gender=config.requirements.test.gender_pct,
-                dialect=config.requirements.test.dialect_pct,
-                age_group=config.requirements.test.age_group_pct,
-                accent=config.requirements.test.accent_pct,
-            ),
-            banned_speakers=set(),
-            seed=seed,
-            genders=config.genders,
-            dialects=config.dialects,
-            age_groups=config.age_groups,
-            accents=config.accents,
-            mean_seconds_per_sample=mean_seconds_per_sample,
-        )
-        test_candidates.append(test_candidate)
-    test_dataset = min(test_candidates, key=lambda x: len(x))
-    logger.info(f"Test dataset:\n{test_dataset}")
-
-    # Build validation split
-    val_candidates: list[Dataset] = list()
-    min_val_hours = config.requirements.val.min_hours
-    max_val_hours = config.requirements.val.max_hours
-    for seed in tqdm(range(4242, 4242 + num_attempts), desc="Computing val splits"):
-        val_candidate = Dataset(
-            df=df,
-            min_samples=int(min_val_hours * 60 * 60 / mean_seconds_per_sample),
-            max_samples=int(max_val_hours * 60 * 60 / mean_seconds_per_sample),
-            requirements=dict(
-                gender=config.requirements.val.gender_pct,
-                dialect=config.requirements.val.dialect_pct,
-                age_group=config.requirements.val.age_group_pct,
-                accent=config.requirements.val.accent_pct,
-            ),
-            banned_speakers=test_dataset.speakers,
-            seed=seed,
-            genders=config.genders,
-            dialects=config.dialects,
-            age_groups=config.age_groups,
-            accents=config.accents,
-            mean_seconds_per_sample=mean_seconds_per_sample,
-        )
-        val_candidates.append(val_candidate)
-    val_dataset = min(val_candidates, key=lambda x: len(x))
-    logger.info(f"Validation dataset:\n{val_dataset}")
-
-    assert set(test_dataset.speakers).intersection(val_dataset.speakers) == set()
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ install-pipx:
 	@if [ "$(shell which pipx)" = "" ]; then \
 		uname=$$(uname); \
 			case $${uname} in \
+				(*Linux*) installCmd='sudo apt install pipx'; ;; \
 				(*Darwin*) installCmd='brew install pipx'; ;; \
 				(*CYGWIN*) installCmd='py -3 -m pip install --upgrade --user pipx'; ;; \
 				(*) installCmd='python3 -m pip install --upgrade --user pipx'; ;; \
@@ -70,7 +71,7 @@ install-poetry:
 	fi
 
 setup-poetry:
-	@poetry env use python3.11 && poetry install --extras kenlm
+	@poetry env use python3.11 && poetry install --extras all
 
 setup-environment-variables:
 	@poetry run python src/scripts/fix_dot_env_file.py
@@ -102,6 +103,8 @@ tree:  ## Print directory tree
 install-pre-commit:  ## Install pre-commit hooks
 	@poetry run pre-commit install
 
+clean: lint format type-check  ## Lint, format, and type-check the code
+
 lint:  ## Lint the code
 	@poetry run ruff check . --fix
 
@@ -109,4 +112,84 @@ format:  ## Format the code
 	@poetry run ruff format .
 
 type-check:  ## Run type checking
-	@poetry run mypy . --install-types --non-interactive --ignore-missing-imports --show-error-codes --check-untyped-defs
+	@poetry run mypy . \
+		--install-types \
+		--non-interactive \
+		--ignore-missing-imports \
+		--show-error-codes \
+		--check-untyped-defs
+
+check: lint format type-check  ## Check the code
+
+roest-315m:  ## Train the Røst-315M model
+	@OMP_NUM_THREADS=1 \
+		accelerate launch \
+		--use-deepspeed \
+		src/scripts/finetune_asr_model.py \
+		model=wav2vec2-small \
+		datasets=[coral,common_voice_17] \
+		dataset_probabilities=[0.95,0.05] \
+		decoder_datasets=[wikipedia,common_voice,reddit] \
+		push_to_hub=true \
+		dataloader_num_workers=4 \
+		model_id=roest-315m \
+		private=true \
+		per_device_batch_size=64
+
+roest-809m:  ## Train the Røst-809M model
+	@OMP_NUM_THREADS=1 \
+		accelerate launch \
+		--use-deepspeed \
+		src/scripts/finetune_asr_model.py \
+		model=whisper-large-turbo \
+		datasets=[coral,common_voice_17] \
+		dataset_probabilities=[0.95,0.05] \
+		push_to_hub=true \
+		dataloader_num_workers=4 \
+		model_id=roest-809m \
+		private=true \
+		per_device_batch_size=64
+
+roest-1b:  ## Train the Røst-1B model
+	@OMP_NUM_THREADS=1 \
+		accelerate launch \
+		--use-deepspeed \
+		src/scripts/finetune_asr_model.py \
+		model=wav2vec2-medium \
+		datasets=[coral,common_voice_17] \
+		dataset_probabilities=[0.95,0.05] \
+		decoder_datasets=[wikipedia,common_voice,reddit] \
+		push_to_hub=true \
+		dataloader_num_workers=4 \
+		model_id=roest-1b \
+		private=true \
+		per_device_batch_size=64
+
+roest-1.5b:  ## Train the Røst-1.5B model
+	@OMP_NUM_THREADS=1 \
+		accelerate launch \
+		--use-deepspeed \
+		src/scripts/finetune_asr_model.py \
+		model=whisper-large \
+		datasets=[coral,common_voice_17] \
+		dataset_probabilities=[0.95,0.05] \
+		push_to_hub=true \
+		dataloader_num_workers=4 \
+		model_id=roest-1.5b \
+		private=true \
+		per_device_batch_size=64
+
+roest-2b:  ## Train the Røst-2B model
+	@OMP_NUM_THREADS=1 \
+		accelerate launch \
+		--use-deepspeed \
+		src/scripts/finetune_asr_model.py \
+		model=wav2vec2-large \
+		datasets=[coral,common_voice_17] \
+		dataset_probabilities=[0.95,0.05] \
+		decoder_datasets=[wikipedia,common_voice,reddit] \
+		push_to_hub=true \
+		dataloader_num_workers=4 \
+		model_id=roest-2b \
+		private=true \
+		per_device_batch_size=64

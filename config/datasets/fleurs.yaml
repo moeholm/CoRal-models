@@ -1,6 +1,7 @@
-fleurs_sv:
+fleurs:
   id: google/fleurs
-  subset: sv_se
+  subset: da_dk
   train_name: train
   text_column: raw_transcription
   audio_column: audio
+  filter_dataset: true

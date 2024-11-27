@@ -1,7 +1,7 @@
 """Script that downloads and builds the Nota dataset.
 
 Usage:
-    python src/scripts/build_nota.py <destination_dir>
+    python src/scripts/build_nota.py DESTINATION_DIR
 """
 
 import logging
@@ -9,7 +9,6 @@ import multiprocessing as mp
 import re
 from pathlib import Path
 from time import sleep
-from typing import List
 from urllib.error import ContentTooShortError
 from zipfile import ZipFile
 
@@ -79,7 +78,7 @@ def download_nota(destination_dir: Path | str) -> None:
 
         # Get URLs to all files on the URL
         regex = re.compile(r"<a href=\"(.+?)\">")
-        all_files: List[str] = regex.findall(str(requests.get(url).content))
+        all_files: list[str] = regex.findall(str(requests.get(url).content))
 
         # Ignore the Parent and README files
         all_files_filtered = list(

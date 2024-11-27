@@ -5,9 +5,10 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Callable, Type
+from typing import Type
 
 import torch
 from omegaconf import DictConfig
@@ -45,6 +46,7 @@ class Wav2Vec2ModelSetup(ModelSetup):
         """
         self.config = config
         self.processor: Processor
+        self.is_main_process = os.getenv("RANK", "0") == "0"
 
     def load_processor(self) -> Wav2Vec2Processor:
         """Return the processor for the model."""
@@ -69,7 +71,8 @@ class Wav2Vec2ModelSetup(ModelSetup):
                 if process_id is not None:
                     log_message += f" in process {process_id}"
                 log_message += ". Retrying in a second."
-                logger.warning(log_message)
+                if self.is_main_process:
+                    logger.warning(log_message)
                 time.sleep(1)
 
         # Set the `model_max_length` attribute of the tokenizer, if it hasn't been set,
@@ -147,34 +150,53 @@ class Wav2Vec2ModelSetup(ModelSetup):
         )
 
         if gradient_accumulation_steps == 0:
-            logger.warning(
-                f"Your `total_batch_size` is too small ({self.config.total_batch_size}), "
-                f"relative to the number of devices ({num_devices}) and your "
-                f"`per_device_batch_size` ({self.config.per_device_batch_size}). It has "
-                f"been set to `per_device_batch_size * num_devices` = "
-                f"{self.config.per_device_batch_size * num_devices}."
-            )
+            if self.is_main_process:
+                logger.warning(
+                    "Your `total_batch_size` is too small "
+                    f"({self.config.total_batch_size}), relative to the number of "
+                    f"devices ({num_devices}) and your `per_device_batch_size` "
+                    f"({self.config.per_device_batch_size}). It has been set to "
+                    "`per_device_batch_size * num_devices` = "
+                    f"{self.config.per_device_batch_size * num_devices}."
+                )
             gradient_accumulation_steps = 1
+
+        fp16 = False
+        bf16 = False
+        if not mps_is_available():
+            if self.config.bf16_allowed and torch.cuda.is_bf16_supported():
+                bf16 = True
+                if self.is_main_process:
+                    logger.info("Mixed precision training with BF16 enabled.")
+            elif self.config.fp16_allowed and torch.cuda.is_available():
+                fp16 = True
+                if self.is_main_process:
+                    logger.info("Mixed precision training with FP16 enabled.")
+
+        if self.config.early_stopping:
+            self.config.save_total_limit = max(self.config.save_total_limit, 1)
 
         args = TrainingArguments(
             output_dir=self.config.model_dir,
             hub_model_id=f"{self.config.hub_organisation}/{self.config.model_id}",
+            hub_private_repo=self.config.private,
             per_device_train_batch_size=self.config.per_device_batch_size,
             per_device_eval_batch_size=self.config.per_device_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=self.config.learning_rate,
+            learning_rate=self.config.model.learning_rate,
             lr_scheduler_type=SchedulerType.COSINE,
             warmup_steps=self.config.warmup_steps,
             max_steps=self.config.max_steps,
-            fp16=self.config.fp16 and not mps_is_available(),
-            push_to_hub=self.config.push_to_hub,
+            fp16=fp16,
+            bf16=bf16,
+            push_to_hub=False,
             eval_strategy="steps",
             eval_steps=self.config.eval_steps,
             save_steps=self.config.save_steps,
             save_strategy="no" if self.config.save_total_limit == 0 else "steps",
             logging_steps=self.config.logging_steps,
             length_column_name="input_length",
-            gradient_checkpointing=True,
+            gradient_checkpointing=self.config.gradient_checkpointing,
             save_total_limit=self.config.save_total_limit,
             load_best_model_at_end=self.config.early_stopping,
             metric_for_best_model="wer",
@@ -184,12 +206,15 @@ class Wav2Vec2ModelSetup(ModelSetup):
             optim=OptimizerNames.ADAMW_TORCH,
             adam_beta1=self.config.adam_first_momentum,
             adam_beta2=self.config.adam_second_momentum,
-            report_to=["wandb"] if self.config.wandb else [],
+            report_to=[self.config.experiment_tracking.type]
+            if self.config.experiment_tracking
+            else [],
             ignore_data_skip=self.config.ignore_data_skip,
             save_safetensors=True,
             use_cpu=hasattr(sys, "_called_from_test"),
             dataloader_num_workers=self.config.dataloader_num_workers,
             ddp_find_unused_parameters=False,
+            dispatch_batches=False,
         )
         return args
 
@@ -249,9 +274,10 @@ def dump_vocabulary(config: DictConfig) -> None:
     """
     # Build the set of all unique characters in the dataset
     unique_characters: set[str] = set(config.characters_to_keep + "|")
+    sorted_unique_characters: list[str] = sorted(unique_characters)
 
     # Build vocabulary
-    vocab = {char: idx for idx, char in enumerate(unique_characters)}
+    vocab = {char: idx for idx, char in enumerate(sorted_unique_characters)}
 
     # Dump the vocabulary to a json file
     model_dir = Path(config.model_dir)

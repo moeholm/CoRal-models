@@ -1,10 +1,7 @@
 """Script that builds and uploads the CoRal speech recognition dataset from the raw data.
 
 Usage:
-    python src/scripts/build_coral_asr.py \
-        [--audio-dir directory/containing/the/audio/subdirectories] \
-        [--metadata-database-path path/to/the/sqlite/database] \
-        [--hub-id organisation/dataset-id]
+    python src/scripts/build_coral_asr.py [key=value] [key=value] ...
 """
 
 import logging
@@ -12,20 +9,19 @@ import multiprocessing as mp
 import shutil
 import sqlite3
 import tarfile
+from functools import partial
 from pathlib import Path
 from time import sleep
 
-import click
-from datasets import (
-    Audio,
-    Dataset,
-    DatasetDict,
-    disable_progress_bar,
-    enable_progress_bar,
-)
+import hydra
+from datasets import Audio, Dataset, DatasetDict
 from joblib import Parallel, delayed
+from omegaconf import DictConfig
 from requests import HTTPError
 from tqdm.auto import tqdm
+
+from coral.utils import no_datasets_progress_bars
+from coral.validation import add_validations
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,41 +31,19 @@ logging.basicConfig(
 logger = logging.getLogger("build_coral_asr")
 
 
-VALIDATION_SET_SPEAKER_IDS: list[str] = list()
-
-
-TEST_SET_SPEAKER_IDS: list[str] = list()
-
-
-@click.command()
-@click.option(
-    "--audio-dir",
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, readable=True),
-    default="/Volumes/CoRal/_new_structure/raw",
-    show_default=True,
-    help="Path to the directory containing the raw audio files.",
+@hydra.main(
+    config_path="../../config", config_name="dataset_creation", version_base=None
 )
-@click.option(
-    "--metadata-database-path",
-    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True),
-    default="/Volumes/CoRal/_new_structure/raw/CoRal_public.db",
-    show_default=True,
-    help="Path to the SQLite database containing the metadata.",
-)
-@click.option(
-    "--hub-id",
-    type=str,
-    default="alexandrainst/coral",
-    show_default=True,
-    help="Identifier of the Hugging Face Hub repository.",
-)
-def main(
-    audio_dir: Path | str, metadata_database_path: Path | str, hub_id: str
-) -> None:
-    """Build and upload the CoRal speech recognition dataset."""
-    metadata_database_path = Path(metadata_database_path)
-    read_aloud_dir = Path(audio_dir) / "recordings"
-    conversation_dir = Path(audio_dir) / "conversations"
+def main(config: DictConfig) -> None:
+    """Build and upload the CoRal speech recognition dataset.
+
+    Args:
+        config:
+            The Hydra configuration object
+    """
+    metadata_database_path = Path(config.metadata_database_path)
+    read_aloud_dir = Path(config.audio_dir) / "recordings"
+    conversation_dir = Path(config.audio_dir) / "conversations"
 
     logger.info("Copying the raw files to the current working directory...")
     temp_read_aloud_dir = copy_audio_directory_to_cwd(audio_dir=read_aloud_dir)
@@ -95,18 +69,56 @@ def main(
         audio_dir=temp_conversation_dir,
     )
 
-    logger.info("Splitting the datasets into train, validation and test sets...")
-    read_aloud_dataset = split_dataset(dataset=read_aloud_dataset)
-    conversation_dataset = split_dataset(dataset=conversation_dataset)
+    logger.info("Validating and filtering the datasets...")
+    read_aloud_dataset = add_validations(
+        dataset=read_aloud_dataset,
+        text_column="text",
+        audio_column="audio",
+        model_id=config.validation.model_id,
+        clean_text=config.validation.clean_text,
+        lower_case=config.validation.lower_case,
+        sampling_rate=config.validation.sampling_rate,
+        characters_to_keep=config.validation.characters_to_keep,
+        batch_size=config.validation.batch_size,
+        max_cer=config.validation.max_cer,
+    )
+    conversation_dataset = add_validations(
+        dataset=conversation_dataset,
+        text_column="text",
+        audio_column="audio",
+        model_id=config.validation.model_id,
+        clean_text=config.validation.clean_text,
+        lower_case=config.validation.lower_case,
+        sampling_rate=config.validation.sampling_rate,
+        characters_to_keep=config.validation.characters_to_keep,
+        batch_size=config.validation.batch_size,
+        max_cer=config.validation.max_cer,
+    )
 
-    logger.info(f"Uploading the datasets to {hub_id!r} on the Hugging Face Hub...")
+    logger.info("Splitting the datasets into train, validation and test sets...")
+    read_aloud_dataset = split_dataset(
+        dataset=read_aloud_dataset,
+        test_speakers=config.test_speakers,
+        val_speakers=config.val_speakers,
+    )
+    conversation_dataset = split_dataset(
+        dataset=conversation_dataset,
+        test_speakers=config.test_speakers,
+        val_speakers=config.val_speakers,
+    )
+
+    logger.info(
+        f"Uploading the datasets to {config.hub_id!r} on the Hugging Face Hub..."
+    )
     upload_dataset(
         read_aloud_dataset=read_aloud_dataset,
         conversation_dataset=conversation_dataset,
-        hub_id=hub_id,
+        hub_id=config.hub_id,
     )
 
-    logger.info(f"All done! See the datasets at https://hf.co/datasets/{hub_id}.")
+    logger.info(
+        f"All done! See the datasets at https://hf.co/datasets/{config.hub_id}."
+    )
 
 
 ##########################################
@@ -281,12 +293,18 @@ def build_conversation_dataset(
 #####################################
 
 
-def split_dataset(dataset: Dataset) -> DatasetDict | None:
+def split_dataset(
+    dataset: Dataset, test_speakers: list[str], val_speakers: list[str]
+) -> DatasetDict | None:
     """Split a dataset into train, validation and test sets.
 
     Args:
         dataset:
             The dataset to split.
+        test_speakers:
+            A list of speakers in the test set.
+        val_speakers:
+            A list of speakers in the validation set.
 
     Returns:
         The split dataset, or None if no training samples are found.
@@ -298,68 +316,92 @@ def split_dataset(dataset: Dataset) -> DatasetDict | None:
     if len(dataset) == 0:
         return None
 
-    with no_progress_bar():
-        train_dataset = dataset.filter(function=examples_belong_to_train, batched=True)
+    with no_datasets_progress_bars():
+        train_dataset = dataset.filter(
+            function=partial(
+                examples_belong_to_train,
+                test_speakers=test_speakers,
+                val_speakers=val_speakers,
+            ),
+            batched=True,
+        )
     splits = dict(train=train_dataset)
 
-    with no_progress_bar():
-        val_dataset = dataset.filter(function=examples_belong_to_val, batched=True)
+    with no_datasets_progress_bars():
+        val_dataset = dataset.filter(
+            function=partial(examples_belong_to_val, val_speakers=val_speakers),
+            batched=True,
+        )
     if len(val_dataset) > 0:
         splits["val"] = val_dataset
 
-    with no_progress_bar():
-        test_dataset = dataset.filter(function=examples_belong_to_test, batched=True)
+    with no_datasets_progress_bars():
+        test_dataset = dataset.filter(
+            function=partial(examples_belong_to_test, test_speakers=test_speakers),
+            batched=True,
+        )
     if len(test_dataset) > 0:
         splits["test"] = test_dataset
 
     return DatasetDict(splits)
 
 
-def examples_belong_to_train(examples: dict[str, list]) -> list[bool]:
+def examples_belong_to_train(
+    examples: dict[str, list], test_speakers: list[str], val_speakers: list[str]
+) -> list[bool]:
     """Check if each example belongs to the training set.
 
     Args:
         examples:
             A batch of examples.
+        test_speakers:
+            A list of speakers in the test set.
+        val_speakers:
+            A list of speakers in the validation set.
 
     Returns:
         A list of booleans indicating whether each example belongs to the training
         set.
     """
     return [
-        speaker_id not in VALIDATION_SET_SPEAKER_IDS + TEST_SET_SPEAKER_IDS
+        speaker_id not in test_speakers + val_speakers
         for speaker_id in examples["id_speaker"]
     ]
 
 
-def examples_belong_to_val(examples: dict[str, list]) -> list[bool]:
+def examples_belong_to_val(
+    examples: dict[str, list], val_speakers: list[str]
+) -> list[bool]:
     """Check if each example belongs to the validation set.
 
     Args:
         examples:
             A batch of examples.
+        val_speakers:
+            A list of speakers in the validation set.
 
     Returns:
         A list of booleans indicating whether each example belongs to the validation
         set.
     """
-    return [
-        speaker_id in VALIDATION_SET_SPEAKER_IDS
-        for speaker_id in examples["id_speaker"]
-    ]
+    return [speaker_id in val_speakers for speaker_id in examples["id_speaker"]]
 
 
-def examples_belong_to_test(examples: dict[str, list]) -> list[bool]:
+def examples_belong_to_test(
+    examples: dict[str, list], test_speakers: list[str]
+) -> list[bool]:
     """Check if each example belongs to the test set.
 
     Args:
         examples:
             A batch of examples.
+        test_speakers:
+            A list of speakers in the test set.
 
     Returns:
         A list of booleans indicating whether each example belongs to the test set.
     """
-    return [speaker_id in TEST_SET_SPEAKER_IDS for speaker_id in examples["id_speaker"]]
+    return [speaker_id in test_speakers for speaker_id in examples["id_speaker"]]
 
 
 #####################################
@@ -512,18 +554,6 @@ def decompress_file(file: Path, destination_dir: Path) -> None:
             shutil.rmtree(decompressed_path, ignore_errors=True)
             file.unlink()
         destination_path.unlink()
-
-
-class no_progress_bar:
-    """Context manager that disables the progress bar."""
-
-    def __enter__(self):
-        """Disable the progress bar."""
-        disable_progress_bar()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Re-enable the progress bar."""
-        enable_progress_bar()
 
 
 def remove_suffixes(path: Path) -> Path:
